@@ -30,5 +30,4 @@ with open('api_key.json','r') as f:
     api_key = json.load(f)
 bittrex_api = Bittrex(api_key['key'], api_key['secret'])
 
-#scrape
-scrape()
+#things to do...
