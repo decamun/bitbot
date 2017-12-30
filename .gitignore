@@ -1,3 +1,4 @@
 env
 api_key.json
 market_histories.json
+*.idea
