@@ -1,3 +1,5 @@
 python-bittrex
 python-binance
 requests
+transitions
+promise
