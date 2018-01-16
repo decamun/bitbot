@@ -1,4 +1,4 @@
-from bittrex import Bittrex
+from bittrex.bittrex import Bittrex, API_V2_0, API_V1_1
 from binance.client import Client
 import json
 import time
@@ -6,9 +6,31 @@ import numpy as np
 import sys
 from transitions import Machine, State
 import requests
+import time
+import decimal
+
+# from:
+# https://stackoverflow.com/questions/38847690/convert-float-to-string-without-scientific-notation-and-false-precision #
+
+# create a new context for this task
+ctx = decimal.Context()
+
+# 20 digits should be enough for everyone :D
+ctx.prec = 20
+
+def float_to_str(f):
+    """
+    Convert the given float to a string,
+    without resorting to scientific notation
+    """
+    d1 = ctx.create_decimal(repr(f))
+    return format(d1, 'f')
+
+########################################################################################################################
 
 def norm_diff(a, b):
     return 2 * (a - np.mean((a, b))) / np.mean((a, b))
+
 
 
 class Market(object):
@@ -25,6 +47,9 @@ class Market(object):
         self.buy_condition_ratio = 1.05
         # maximum transfer time allowable for cash coins
         self.max_transfer_time = 120
+        # amount of time to wait before balancing
+        self.balance_wait_time = 5*60   # seconds
+        self.last_action_time = time.time()
         print('Initializing State Machine...')
         self.arbitrage_target = None
         self.partner = None
@@ -35,7 +60,8 @@ class Market(object):
             State(name='cash_balance'),
             State(name='buying', on_enter='buy_target'),
             State(name='selling', on_enter='sell_target'),
-            State(name='transferring', on_enter='transfer_target')
+            State(name='transferring', on_enter='transfer_target'),
+            State(name='balancing', on_enter='balance_target')
         ]
 
         transitions = [
@@ -45,15 +71,16 @@ class Market(object):
             {'trigger': 'disconnect', 'source': '*', 'dest': 'not_connected'},
             {'trigger': 'have_cash', 'source': 'waiting', 'dest': 'cash_balance'},
             {'trigger': 'wait', 'source': '*', 'dest': 'waiting'},
-            {'trigger': 'transfer', 'source': 'cash_balance', 'dest': 'transferring'}
+            {'trigger': 'transfer', 'source': 'cash_balance', 'dest': 'transferring'},
+            {'trigger': 'balance', 'source': 'cash_balance', 'dest': 'balancing'}
         ]
         self.machine = Machine(self, states=states, transitions=transitions)
         self.disconnect()
         print('Setting Default Symbols...')
         self.trading_pairs = dict()
         #symbol: the symbol the market api uses for the trading pair
-        #asset: the symbol for the 'asset' to be bought and sold
-        #cash: the symbol for the 'cash' used to buy and sell and to be moved to other markets
+        #asset: the symbol for the 'asset' to be held
+        #cash: the symbol for the 'cash' to be moved to other markets
         self.trading_pairs['XLM/BTC'] = {'symbol': 'BTC-XLM', 'asset': 'BTC', 'cash': 'XLM'}
         self.trading_pairs['XLM/ETH'] = {'symbol': 'ETH-XLM', 'asset': 'ETH', 'cash': 'XLM'}
         self.trading_pairs['XRP/BTC'] = {'symbol': 'BTC-XRP', 'asset': 'BTC', 'cash': 'XRP'}
@@ -67,6 +94,7 @@ class Market(object):
         print('Getting Prices...')
         self.prices = dict()
         self.update_prices()
+        self.orderbooks = dict()
         print('Setting Wallets...')
         self.wallets = dict()
         #symbol: symbol the market api uses for the currency. Should be same as wallet_id
@@ -75,16 +103,16 @@ class Market(object):
                                'cryptocompare_id': 1182, 'memo': None, 'address': None, 'block_thresh': 30}
         self.wallets['ETH'] = {'symbol': 'ETH', 'is_cash': False, 'cash_thresh': 0.00, 'asset_thresh': 0.01,
                                'cryptocompare_id': 7605, 'memo': None, 'address': None, 'block_thresh': 30}
-        self.wallets['XRP'] = {'symbol': 'XRP', 'is_cash': True, 'cash_thresh': 5, 'asset_thresh': 0.00,
+        self.wallets['XRP'] = {'symbol': 'XRP', 'is_cash': False, 'cash_thresh': 5, 'asset_thresh': 0.00,
                                'cryptocompare_id': 5031, 'memo': None, 'address': None, 'block_thresh': 30}
         self.wallets['XLM'] = {'symbol': 'XLM', 'is_cash': True, 'cash_thresh': 5, 'asset_thresh': 0.00,
                                'cryptocompare_id': 4614, 'memo': None, 'address': None, 'block_thresh': 30}
         self.wallets['NAV'] = {'symbol': 'NAV', 'is_cash': True, 'cash_thresh': 5, 'asset_thresh': 0.00,
                                'cryptocompare_id': 4571, 'memo': None, 'address': None, 'block_thresh': 10}
-        # self.update_cash_coins() #uncomment to check blocktimes
+        # self.update_cash_coins() #EXPERIMENTAL uncomment to check blocktimes and use this to decide which coins to trade
 
+        # set and verify deposit addresses
         self.set_deposit_addresses()
-        # verify deposit addresses
         if not self.verify_deposit_addresses():
             print 'Check Deposit Addresses!'
             raise Exception()
@@ -96,6 +124,13 @@ class Market(object):
         print('Done Initializing Market.\n_________________________________________________________________\n')
 
     def set_deposit_addresses(self):
+        return
+
+    def cleanup(self):
+        #miscelaneous cleanup operations
+        return
+
+    def update_orderbook(self, pair_id):
         return
 
     def verify_deposit_address(self, symbol, address, memo = None):
@@ -143,23 +178,43 @@ class Market(object):
             self.wallets[wallet_id]['is_cash'] = is_cash
 
     def get_buy_amount(self, pair_id):
-        amount = self.buy_ratio * self.balances[self.trading_pairs[pair_id]['cash']]
-        return amount
+        balance = self.balances[self.trading_pairs[pair_id]['cash']]
+        self.update_orderbook(pair_id)
+        partner_price = self.partner.prices[pair_id]
+        rate = (1 - self.opportunity_thresh) * partner_price
+        sell_orders = np.asarray(self.orderbooks[pair_id]['sell'])
+        good_orders = np.where(sell_orders[:, 1] < rate)
+        amount = np.sum(sell_orders[good_orders, 0])
+        if amount > balance:
+            amount = balance
+        print amount
+        return amount, rate
 
     def get_sell_amount(self, pair_id):
-        cash_value = self.prices[pair_id]
-        amount = self.sell_ratio * self.balances[self.trading_pairs[pair_id]['asset']] / cash_value
-        return amount
+        balance = self.balances[self.trading_pairs[pair_id]['cash']]
+        self.update_orderbook(pair_id)
+        partner_price = self.partner.prices[pair_id]
+        rate = (1 + self.opportunity_thresh) * partner_price
+        buy_orders = np.asarray(self.orderbooks[pair_id]['buy'])
+        good_orders = np.where(buy_orders[:, 1] > rate)
+        amount = np.sum(buy_orders[good_orders, 0])
+        if amount > balance:
+            amount = balance
+        print amount
+        return amount, rate
 
     def get_transfer_amount(self, pair_id):
-        #TODO determine this amount smartly
         amount = self.balances[self.trading_pairs[pair_id]['cash']]
         return amount
 
-    def buy_order(self, amount, pair_id):
+    def get_balance_amount(self, pair_id):
+        amount = self.balances[self.trading_pairs[pair_id]['cash']]/2
+        return amount
+
+    def buy_order(self, amount, rate, pair_id):
         return
 
-    def sell_order(self, amount, pair_id):
+    def sell_order(self, amount, rate, pair_id):
         return
 
     def transfer_order(self, amount, pair_id):
@@ -176,22 +231,28 @@ class Market(object):
     def is_target(self, symbol_id=None):
         return self.trading_pairs[symbol_id] is self.trading_pairs[self.arbitrage_target]
 
-    def buy_target(self, pair_id):
-        amount = self.get_buy_amount(pair_id)
-        asset = self.trading_pairs[pair_id]['asset']
-        cash = self.trading_pairs[pair_id]['cash']
-        print 'Selling %f %s for %s' % (amount, cash, asset)
-        self.sell_order(amount, pair_id) #these are switched because the market thinks
-        # we are selling what we consider ourselves to be buying
+    def sell_target(self, pair_id):
+        amount, rate = self.get_sell_amount(pair_id)
+        if amount > 0:
+            asset = self.trading_pairs[pair_id]['asset']
+            cash = self.trading_pairs[pair_id]['cash']
+            print 'Selling %f %s for %s' % (amount, cash, asset)
+            self.sell_order(amount, rate, pair_id)
+        else:
+            print '...Aborted Sell'
+
         self.wait()
 
-    def sell_target(self, pair_id):
-        amount = self.get_sell_amount(pair_id)
-        asset = self.trading_pairs[pair_id]['asset']
-        cash = self.trading_pairs[pair_id]['cash']
-        print 'Buying %f %s with %s' % (amount, cash, asset)
-        self.buy_order(amount, pair_id) #these are switched because the market thinks
-        # we are buying what we consider ourselves to be selling
+    def buy_target(self, pair_id):
+        amount, rate = self.get_buy_amount(pair_id)
+        if amount > 0:
+            asset = self.trading_pairs[pair_id]['asset']
+            cash = self.trading_pairs[pair_id]['cash']
+            print 'Buying %f %s with %s' % (amount, cash, asset)
+            self.buy_order(amount, rate, pair_id)
+        else:
+            print '...Aborted Buy'
+
         self.wait()
 
     def transfer_target(self, pair_id):
@@ -201,6 +262,12 @@ class Market(object):
         self.transfer_order(amount, pair_id)
         self.wait()
 
+    def balance_target(self, pair_id):
+        cash = self.trading_pairs[pair_id]['cash']
+        amount = self.get_balance_amount(pair_id)
+        print 'Balancing %f %s to partner' % (amount, cash)
+        self.transfer_order(amount, pair_id)
+        self.wait()
 
     def set_arbitrage_target(self, symbol_id=None):
         self.arbitrage_target = symbol_id
@@ -300,40 +367,56 @@ class Market(object):
         best_opportunity = None
         best_spread = None
         type = None
-        for symbol_id in self.price_spreads:
-            if abs(self.price_spreads[symbol_id]) > self.opportunity_thresh \
-                    and abs(self.price_spreads[symbol_id]) > best_spread:
+        for pair_id in self.price_spreads:
+
+            cash_id = self.trading_pairs[pair_id]['cash']
+            asset_id = self.trading_pairs[pair_id]['asset']
+
+            # check for spread opportunities
+            if abs(self.price_spreads[pair_id]) > self.opportunity_thresh \
+                    and abs(self.price_spreads[pair_id]) > best_spread:
+
+                # check for transfer opportunities
+                if (self.is_cash_balance() or self.is_waiting()) and self.price_spreads[pair_id] < 0 \
+                        and self.balances[asset_id] \
+                        > self.wallets[asset_id]['asset_thresh']:
+                    best_opportunity = pair_id
+                    best_spread = abs(self.price_spreads[pair_id])
+                    type = 'BUY'
 
                 # check for cash necessary opportunities
-                if self.is_cash_balance() and self.trading_pairs[symbol_id]['cash'] in self.cash_balances:
-                    # buy opportunity
-                    if self.price_spreads[symbol_id] > 0:
-                        best_opportunity = symbol_id
-                        best_spread = abs(self.price_spreads[symbol_id])
-                        type = 'BUY'
+                if self.is_cash_balance() and cash_id in self.cash_balances:
+                    # SELL opportunity
+                    if self.price_spreads[pair_id] > 0:
+                        best_opportunity = pair_id
+                        best_spread = abs(self.price_spreads[pair_id])
+                        type = 'SELL'
 
                     # transfer opportunity
                     else:
-                        best_opportunity = symbol_id
-                        best_spread = abs(self.price_spreads[symbol_id])
+                        best_opportunity = pair_id
+                        best_spread = abs(self.price_spreads[pair_id])
                         type = 'TRANSFER'
 
+            # check for balance opportunity
+            elif self.is_cash_balance() and cash_id in self.cash_balances \
+                    and self.partner.balances[cash_id] < self.partner.wallets[cash_id]['cash_thresh'] \
+                    and best_spread is None\
+                    and time.time() - self.last_action_time > self.balance_wait_time:
+                best_opportunity = pair_id
+                type = 'BALANCE'
 
-                # check for transfer opportunities
-                if (self.is_cash_balance() or self.is_waiting()) and self.price_spreads[symbol_id] < 0 \
-                        and self.balances[self.trading_pairs[symbol_id]['asset']] \
-                        > self.wallets[self.trading_pairs[symbol_id]['asset']]['asset_thresh']:
-                    best_opportunity = symbol_id
-                    best_spread = abs(self.price_spreads[symbol_id])
-                    type = 'SELL'
 
         #handle best opportunity
         if best_opportunity is not None:
             print 'Opportunity Found: Symbol %s, Type %s' % (best_opportunity, type)
+            self.last_action_time = time.time()
             if type=='BUY':
                 self.buy(best_opportunity)
             elif type == 'SELL':
                 self.sell(best_opportunity)
+            elif type == 'BALANCE':
+                self.balance(best_opportunity)
             else: #type == 'TRANSFER'
                 self.transfer(best_opportunity)
         else:
@@ -388,16 +471,37 @@ class BinanceMarket(Market):
 
         return new_balances
 
-    def buy_order(self, amount, pair_id):
+    def buy_order(self, amount, rate, pair_id):
         symbol = self.trading_pairs[pair_id]['symbol']
-        return
-        resp = self.client.order_market_buy(symbol=symbol, quantity=amount)
+        # return
+        resp = self.client.order_limit_buy(timeInForce=Client.TIME_IN_FORCE_IOC, symbol=symbol, quantity=amount,
+                                           price=float_to_str(rate))
+        print resp
 
-    def sell_order(self, amount, pair_id):
+    def sell_order(self, amount, rate, pair_id):
         symbol = self.trading_pairs[pair_id]['symbol']
-        return
-        resp = self.client.order_market_sell(symbol=symbol, quantity=amount)
+        # return
+        resp = self.client.order_limit_sell(timeInForce=Client.TIME_IN_FORCE_IOC, symbol=symbol, quantity=amount,
+                                            price=float_to_str(rate))
+        print resp
 
+    def update_orderbook(self, pair_id, retry_count=0):
+        orderbook = dict()
+        try:
+            resp = self.client.get_order_book(symbol=self.trading_pairs[pair_id]['symbol'])
+            buy_orders = []
+            sell_orders = []
+            for order in resp['bids']:
+                buy_orders.append((float(order[1]), float(order[0])))
+            for order in resp['asks']:
+                sell_orders.append((float(order[1]), float(order[0])))
+            orderbook['buy'] = buy_orders
+            orderbook['sell'] = sell_orders
+            self.orderbooks[pair_id] = orderbook
+        except:
+            if retry_count < 5:
+                print 'Retying get_order_book (binance)...'
+                self.update_orderbook(pair_id, retry_count+1)
 
     def transfer_order(self, amount, pair_id):
         symbol = self.trading_pairs[pair_id]['cash']
@@ -405,13 +509,15 @@ class BinanceMarket(Market):
         memo = self.partner.wallets[symbol]['memo']
 
         print 'Transfer Order: %s %s %s' % (symbol, address, memo)
-        return
+        # return
         resp = self.client.withdraw(asset=symbol, address=address, addressTag=memo, amount=amount)
+        print resp
 
 class BittrexMarket(Market):
     def __init__(self, key, secret):
         print('Bittrex Market Initializing...')
-        self.api = Bittrex(key, secret)
+        self.api_v2 = Bittrex(key, secret, api_version=API_V2_0)
+        self.api_v1 = Bittrex(key, secret, api_version=API_V1_1)
         Market.__init__(self)
 
     def set_deposit_addresses(self):
@@ -424,7 +530,7 @@ class BittrexMarket(Market):
         self.wallets['XLM']['memo'] = 'df33d069d9194f00bb7'
 
     def verify_deposit_address(self, symbol, address, memo = None):
-        resp = self.api.get_deposit_address(symbol)
+        resp = self.api_v2.get_deposit_address(symbol)
         if resp['success']:
             arg = resp['result']['Address']
             print 'expected: %s or %s, got: %s' % (address, memo, arg)
@@ -434,12 +540,12 @@ class BittrexMarket(Market):
 
     def fetch_prices(self, to_update):
         new_prices = dict()
-        resp = self.api.get_market_summaries()
+        resp = self.api_v2.get_market_summaries()
         if resp['success']:
             for market in resp['result']:
                 for pair in self.trading_pairs:
-                    if market['MarketName'] == self.trading_pairs[pair]['symbol']:
-                        new_prices[pair] = market['Last']
+                    if market['Market']['MarketName'] == self.trading_pairs[pair]['symbol']:
+                        new_prices[pair] = market['Summary']['Last']
             return new_prices
         else:
             raise Exception(message='Bittrex market_summaries api failure')
@@ -449,29 +555,41 @@ class BittrexMarket(Market):
             to_update = self.wallets
         symbols = [self.wallets[w]['symbol'] for w in to_update]
         new_balances = dict()
-        resp = self.api.get_balances()
+        resp = self.api_v2.get_balances()
         if resp['success']:
-            for balance in resp['result']:
-                if str(balance['Currency']) in symbols:
-                    new_balances[str(balance['Currency'])] = balance['Available']
+            for currency in resp['result']:
+                if str(currency['Currency']['Currency']) in symbols:
+                    new_balances[str(currency['Currency']['Currency'])] = currency['Balance']['Available']
 
             return new_balances
         else:
             return self.balances
 
-    def buy_order(self, amount, pair_id):
-        return
-        #TODO be VERY careful if you uncomment this because you will start moving real money
-        resp = self.api.trade_buy(market=self.trading_pairs[pair_id]['symbol'], order_type='MARKET', quantity=amount,
-                                  time_in_effect='IMMEDIATE_OR_CANCEL', condition_type='LESS_THAN',
-                                  target=self.buy_condition_ratio * self.prices[pair_id])
+    def update_orderbook(self, pair_id, retry_count=0):
+        orderbook = dict()
+        resp = self.api_v1.get_orderbook(self.trading_pairs[pair_id]['symbol'])
+        if resp['success']:
+            buy_orders = []
+            sell_orders = []
+            for order in resp['result']['buy']:
+                buy_orders.append(([order['Quantity'], order['Rate']]))
+            for order in resp['result']['sell']:
+                sell_orders.append(([order['Quantity'], order['Rate']]))
+            orderbook['buy'] = buy_orders
+            orderbook['sell'] = sell_orders
+            self.orderbooks[pair_id] = orderbook
+        else:
+            if retry_count < 5:
+                print 'Retying get_orderbook (bittrex)...'
+                self.update_orderbook(pair_id, retry_count+1)
 
-    def sell_order(self, amount, pair_id):
-        return
-        #TODO be VERY careful if you uncomment this because you will start moving real money
-        resp = self.api.trade_sell(market=self.trading_pairs[pair_id]['symbol'], order_type='MARKET', quantity=amount,
-                                   time_in_effect='IMMEDIATE_OR_CANCEL',
-                                   condition_type='LESS_THAN', target=self.sell_condition_ratio * self.prices[pair_id])
+    def buy_order(self, amount, rate, pair_id):
+        resp = self.api_v1.buy_limit(market=self.trading_pairs, quantity=amount, rate=float_to_str(rate))
+        print resp
+
+    def sell_order(self, amount, rate, pair_id):
+        resp = self.api_v1.sell_limit(market=self.trading_pairs, quantity=amount, rate=float_to_str(rate))
+        print resp
 
     def transfer_order(self, amount, pair_id):
         symbol = self.trading_pairs[pair_id]['cash']
@@ -479,12 +597,21 @@ class BittrexMarket(Market):
         memo = self.partner.wallets[symbol]['memo']
 
         print 'Transfer Order: %s %s %s' % (symbol, address, memo)
-        return
-        resp = self.api._api_query(path_dict={
-            API_V1_1: '/account/withdraw',
-            API_V2_0: '/key/balance/withdrawcurrency'
-        }, options={'currency': symbol, 'quantity': amount, 'address': address, 'paymentid': memo}, protection=PROTECTION_PRV)
+        if memo is not None:
+            resp = self.api_v1._api_query(path_dict={
+                API_V1_1: '/account/withdraw',
+                API_V2_0: '/key/balance/withdrawcurrency'
+            }, options={'currency': symbol, 'quantity': amount, 'address': address, 'paymentid': memo}, protection='prv')
+        else:
+            resp = self.api_v1._api_query(path_dict={
+                API_V1_1: '/account/withdraw',
+                API_V2_0: '/key/balance/withdrawcurrency'
+            }, options={'currency': symbol, 'quantity': amount, 'address': address}, protection='prv')
+        print resp
 
+    def cleanup(self):
+        orders = self.api_v1.get_open_orders()
+        print orders
 
 # load api keys
 with open('api_key.json', 'r') as f:
@@ -504,32 +631,16 @@ binance_market.connect(bittrex_market)
 print('Entering Loop...')
 while 1:  # go forever
     # get balances
-    print('Getting Balances...')
     bittrex_market.update_balances()
     binance_market.update_balances()
     #get prices
-    print('Getting Prices...')
     binance_market.update_prices()
     bittrex_market.update_prices()
     # get spreads
-    print('Getting Spreads...')
     bittrex_market.calculate_spreads()
     binance_market.calculate_spreads()
-
-    # print('Bittrex Balances:')
-    # print(bittrex_market.balances)
-    # print(bittrex_market.cash_balances)
-    # print('Binance Balances:')
-    # print(binance_market.balances)
-    # print(binance_market.cash_balances)
-    # print('Bittrex Prices:')
-    # print(bittrex_market.prices)
-    # print('Binance Prices:')
-    # print(binance_market.prices)
-
     # get opportunities
-    print('Getting Opportunities...')
-    print('Bittrex... State: %s, Balances: %s, Prices: %s, Spreads: %s' % (bittrex_market.state, str(bittrex_market.balances), str(bittrex_market.prices), str(bittrex_market.price_spreads)))
+    print('Bittrex: { State: %s, Balances: %s, Prices: %s, Spreads: %s}' % (bittrex_market.state, str(bittrex_market.balances), str(bittrex_market.prices), str(bittrex_market.price_spreads)))
     bittrex_market.check_for_opportunities()
-    print('Binance... State: %s, Balances: %s, Prices: %s, Spreads: %s' % (binance_market.state, str(binance_market.balances), str(binance_market.prices), str(binance_market.price_spreads)))
+    print('Binance: { State: %s, Balances: %s, Prices: %s, Spreads: %s}' % (binance_market.state, str(binance_market.balances), str(binance_market.prices), str(binance_market.price_spreads)))
     binance_market.check_for_opportunities()
